@@ -21,6 +21,8 @@ package org.apache.flink.training.exercises.longrides;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -33,6 +35,7 @@ import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
 import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
 import org.apache.flink.util.Collector;
 
+import java.io.IOException;
 import java.time.Duration;
 
 /**
@@ -98,17 +101,110 @@ public class LongRidesExercise {
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
 
+        private static final long TWO_HOURS_MS = Duration.ofHours(2).toMillis();
+        private static final long MAX_OUT_OF_ORDER_MS = Duration.ofSeconds(60).toMillis();
+
+        private transient ValueState<TaxiRide> startState;
+        private transient ValueState<TaxiRide> endState;
+
+        private transient ValueState<Long> longRideTimerTs;
+        private transient ValueState<Long> endCleanupTimerTs;
+
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            startState = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("start", TaxiRide.class)
+            );
+            endState = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("end", TaxiRide.class)
+            );
+
+            longRideTimerTs = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("longRideTimer", Long.class)
+            );
+            endCleanupTimerTs = getRuntimeContext().getState(
+                    new ValueStateDescriptor<>("endCleanupTimer", Long.class)
+            );
         }
 
         @Override
-        public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+        public void processElement(TaxiRide ride, Context ctx, Collector<Long> out)
+                throws Exception {
+            if (ride.isStart) {
+                // START arrived
+                TaxiRide end = endState.value();
+                if (end != null) {
+                    long duration = end.getEventTimeMillis() - ride.getEventTimeMillis();
+                    if (duration > TWO_HOURS_MS) {
+                        out.collect(ride.rideId);
+                    }
+                    // cleanup + cancel long timer
+                    clearStartAndLongTimer(ctx);
+                } else {
+                    startState.update(ride);
+
+                    long timerTs = ride.getEventTimeMillis() + TWO_HOURS_MS;
+                    ctx.timerService().registerEventTimeTimer(timerTs);
+                    longRideTimerTs.update(timerTs);
+                }
+            } else {
+                // END arrived
+                TaxiRide start = startState.value();
+                if (start != null) {
+                    long duration = ride.getEventTimeMillis() - start.getEventTimeMillis();
+                    if (duration > TWO_HOURS_MS) {
+                        out.collect(ride.rideId);
+                    }
+                    // cleanup + cancel long timer
+                    clearStartAndLongTimer(ctx);
+                } else {
+                    // START missing
+                    endState.update(ride);
+
+                    long cleanupTs = ride.getEventTimeMillis() + MAX_OUT_OF_ORDER_MS + 1;
+                    ctx.timerService().registerEventTimeTimer(cleanupTs);
+                    endCleanupTimerTs.update(cleanupTs);
+                }
+            }
+        }
 
         @Override
-        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Long> out)
+                throws Exception {
+            Long longTs = longRideTimerTs.value();
+            if (longTs != null && timestamp == longTs) {
+                // 2 hours passed since START; if END still not seen, alert.
+                TaxiRide start = startState.value();
+                if (start != null) {
+                    out.collect(start.rideId);
+                }
+                clearStartAndLongTimer(ctx);
+                return;
+            }
+
+            Long cleanupTs = endCleanupTimerTs.value();
+            if (cleanupTs != null && timestamp == cleanupTs) {
+                // END-only record expired; drop it
+                clearEndAndCleanupTimer(ctx);
+            }
+        }
+
+        private void clearStartAndLongTimer(KeyedProcessFunction<Long, TaxiRide, Long>.Context ctx) throws Exception {
+            Long ts = longRideTimerTs.value();
+            if (ts != null) {
+                ctx.timerService().deleteEventTimeTimer(ts);
+            }
+            longRideTimerTs.clear();
+            startState.clear();
+        }
+
+        private void clearEndAndCleanupTimer(KeyedProcessFunction<Long, TaxiRide, Long>.Context ctx) throws Exception {
+            Long ts = endCleanupTimerTs.value();
+            if (ts != null) {
+                ctx.timerService().deleteEventTimeTimer(ts);
+            }
+            endCleanupTimerTs.clear();
+            endState.clear();
+        }
     }
 }
